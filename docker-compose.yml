@@ -1,0 +1,221 @@
+# Docker Compose for patient-management-microservices
+# NOTE: service folder names, ports and env var names are assumptions - adjust to match your repo.
+
+x-spring-common: &spring-common
+  restart: unless-stopped
+  networks:
+    - clinic-net
+
+services:
+  # ---------- Databases ----------
+  auth-db:
+    image: postgres:16-alpine
+    container_name: auth-db
+    environment:
+      POSTGRES_DB: authdb
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      - auth-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d authdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [clinic-net]
+
+  patient-db:
+    image: postgres:16-alpine
+    container_name: patient-db
+    environment:
+      POSTGRES_DB: patientdb
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      - patient-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d patientdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [clinic-net]
+
+  appointment-db:
+    image: postgres:16-alpine
+    container_name: appointment-db
+    environment:
+      POSTGRES_DB: appointmentdb
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      - appointment-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d appointmentdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [clinic-net]
+
+  billing-db:
+    image: postgres:16-alpine
+    container_name: billing-db
+    environment:
+      POSTGRES_DB: billingdb
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      - billing-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d billingdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [clinic-net]
+
+  # ---------- Kafka -----------
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: kafka
+    ports:
+      - "9094:9094"   # host access
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    networks: [clinic-net]
+
+  # ---------- Application services ----------
+  auth-service:
+    <<: *spring-common
+    build: ./auth-service
+    container_name: auth-service
+    depends_on:
+      auth-db:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://auth-db:5432/authdb
+      SPRING_DATASOURCE_USERNAME: ${DB_USER:-postgres}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:-postgres}
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_SQL_INIT_MODE: always
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+
+  patient-service:
+    <<: *spring-common
+    build: ./patient-service
+    container_name: patient-service
+    depends_on:
+      patient-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      billing-service:
+        condition: service_started
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://patient-db:5432/patientdb
+      SPRING_DATASOURCE_USERNAME: ${DB_USER:-postgres}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:-postgres}
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_SQL_INIT_MODE: always
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      BILLING_SERVICE_ADDRESS: billing-service
+      BILLING_SERVICE_GRPC_PORT: 9001
+
+  appointment-service:
+    <<: *spring-common
+    build: ./appointment-service
+    container_name: appointment-service
+    depends_on:
+      appointment-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://appointment-db:5432/appointmentdb
+      SPRING_DATASOURCE_USERNAME: ${DB_USER:-postgres}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:-postgres}
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+
+  billing-service:
+    <<: *spring-common
+    build: ./billing-service
+    container_name: billing-service
+    depends_on:
+      billing-db:
+        condition: service_healthy
+    ports:
+      - "9001:9001"   # gRPC (optional on host, handy for grpcurl/Postman)
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://billing-db:5432/billingdb
+      SPRING_DATASOURCE_USERNAME: ${DB_USER:-postgres}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:-postgres}
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      GRPC_SERVER_PORT: 9001
+
+  analytics-service:
+    <<: *spring-common
+    build: ./analytics-service
+    container_name: analytics-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+
+  # notification-service:
+  #   <<: *spring-common
+  #   build: ./notification-service
+  #   container_name: notification-service
+  #   depends_on:
+  #     kafka:
+  #       condition: service_healthy
+  #   environment:
+  #     SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  #     SPRING_MAIL_HOST: smtp.gmail.com
+  #     SPRING_MAIL_PORT: 587
+  #     SPRING_MAIL_USERNAME: ${MAIL_USERNAME:-}
+  #     SPRING_MAIL_PASSWORD: ${MAIL_APP_PASSWORD:-}   # Gmail app password, not your account password
+
+  api-gateway:
+    <<: *spring-common
+    build: ./api-gateway
+    container_name: api-gateway
+    ports:
+      - "4004:4004"
+    depends_on:
+      - auth-service
+      - patient-service
+      - appointment-service
+    environment:
+      AUTH_SERVICE_URL: http://auth-service:4005
+      PATIENT_SERVICE_URL: http://patient-service:4000
+      APPOINTMENT_SERVICE_URL: http://appointment-service:4002
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+
+networks:
+  clinic-net:
+    driver: bridge
+
+volumes:
+  auth-db-data:
+  patient-db-data:
+  appointment-db-data:
+  billing-db-data:
+  kafka-data:
